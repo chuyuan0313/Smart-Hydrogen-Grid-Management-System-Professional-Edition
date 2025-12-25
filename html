@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>智慧氫能電網控制系統</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="container">
+
+    <header class="header">
+      <div class="brand">
+        <h1>智慧氫能電網控制系統</h1>
+        <div class="meta">
+          <span class="pill"><span id="dot" class="dot"></span><span id="conn">OFFLINE</span></span>
+          <span class="pill">SRC: <span id="srcText">--</span></span>
+          <span class="pill">POLICY: <span id="policyText">--</span></span>
+        </div>
+      </div>
+
+      <div class="right">
+        <div class="kv"><div class="k">NTP TIME</div><div class="v" id="ntpTime">--:--:--</div></div>
+        <div class="kv"><div class="k">UPTIME</div><div class="v" id="uptime">--:--</div></div>
+        <div class="kv"><div class="k">RSSI</div><div class="v"><span id="rssi">--</span> dBm</div></div>
+      </div>
+    </header>
+
+    <main class="layout">
+
+      <section class="block" aria-label="數據顯示">
+        <div class="block-h">
+          <div class="block-title">即時監控數據</div>
+          <div class="block-sub">固定版面</div>
+        </div>
+
+        <div class="metrics">
+          <div class="metric" id="card-grid-v">
+            <div class="m-top"><div class="m-label">市電電壓</div><div class="m-badge mains">MAINS</div></div>
+            <div class="m-value"><span id="gridV">0.0</span><span class="m-unit">V</span></div>
+            <div class="m-foot"><span id="gridVTag" class="m-tag mains">LIVE</span></div>
+          </div>
+
+          <div class="metric" id="card-grid-a">
+            <div class="m-top"><div class="m-label">市電電流</div><div class="m-badge mains">MAINS</div></div>
+            <div class="m-value"><span id="gridA">0.00</span><span class="m-unit">A</span></div>
+            <div class="m-foot"><span id="gridATag" class="m-tag mains">LIVE</span></div>
+          </div>
+
+          <div class="metric" id="card-h2-v">
+            <div class="m-top"><div class="m-label">氫能電壓</div><div class="m-badge hydro">H2</div></div>
+            <div class="m-value"><span id="h2V">--</span><span class="m-unit" id="h2VUnit"></span></div>
+            <div class="m-foot"><span id="h2VTag" class="m-tag hydro">STANDBY</span></div>
+          </div>
+
+          <div class="metric" id="card-h2-a">
+            <div class="m-top"><div class="m-label">氫能電流</div><div class="m-badge hydro">H2</div></div>
+            <div class="m-value"><span id="h2A">0.00</span><span class="m-unit" id="h2AUnit">A</span></div>
+            <div class="m-foot"><span id="h2ATag" class="m-tag hydro">STANDBY</span></div>
+          </div>
+
+          <div class="metric span-2" id="card-power">
+            <div class="m-top"><div class="m-label">即時功率</div></div>
+            <div class="m-value"><span id="pwrW">0</span><span class="m-unit">W</span></div>
+            <div class="m-foot"></div>
+          </div>
+
+          <div class="metric span-2" id="card-cost">
+            <div class="m-top"><div class="m-label">預估每小時電費</div></div>
+            <div class="m-value"><span id="cost">$0.00</span></div>
+            <div class="m-foot"><span class="m-note">費率: 4.0元/度</span></div>
+          </div>
+
+          <div class="metric" id="card-batt-v">
+            <div class="m-top"><div class="m-label">蓄電池電壓</div><div class="m-badge neutral">DC</div></div>
+            <div class="m-value"><span id="battV">0.00</span><span class="m-unit">V</span></div>
+            <div class="m-foot"><span class="m-tag neutral">BUS</span></div>
+          </div>
+
+          <div class="metric" id="card-batt-a">
+            <div class="m-top"><div class="m-label">蓄電池電流</div><div class="m-badge neutral">DC</div></div>
+            <div class="m-value"><span id="battA">0.00</span><span class="m-unit">A</span></div>
+            <div class="m-foot"><span class="m-tag neutral">SHUNT</span></div>
+          </div>
+
+          <div class="metric tp-break" aria-hidden="true"></div>
+
+          <!-- 台電：備用/備轉（% / 萬瓩） -->
+          <div class="metric span-2" id="card-tp-reserve">
+            <div class="m-top">
+              <div class="m-label">剩餘備用容量 / 剩餘備轉容量</div>
+              <div class="m-badge neutral">TP</div>
+            </div>
+            <div class="m-value">
+              <span id="tpResvRate">--</span><span class="m-unit">%（備用容量）</span>
+              <span class="tp-sep">/</span>
+              <span id="tpResvMW">--</span><span class="m-unit">萬瓩（備轉容量）</span>
+            </div>
+            <div class="m-foot">
+              <span class="m-tag neutral">指標: <span id="tpInd">--</span></span>
+              <span class="small">預測尖峰: <span id="tpPeakHr">--</span></span>
+            </div>
+          </div>
+
+          <!-- 台電：即時負載/利用率 -->
+          <div class="metric span-2" id="card-tp-now">
+            <div class="m-top">
+              <div class="m-label">目前全系統用電負載 / 目前利用率</div>
+              <div class="m-badge neutral">TP</div>
+            </div>
+            <div class="m-value tp-compact">
+              <span id="tpCurrLoad">--</span><span class="m-unit">萬瓩（負載）</span>
+              <span class="tp-sep">/</span>
+              <span id="tpUtil">--</span><span class="m-unit">%</span>
+            </div>
+            <div class="m-foot">
+              <span class="small" id="tpStatus">資料不可用</span>
+              <span class="small">Age: <span id="tpAge">--</span>s</span>
+            </div>
+          </div>
+
+          <!-- 台電：預測供需（萬瓩） -->
+          <div class="metric span-2" id="card-tp-forecast">
+            <div class="m-top">
+              <div class="m-label">預測供需（預測尖峰可供給上限 / 預測尖峰需求負載）</div>
+              <div class="m-badge neutral">TP</div>
+            </div>
+            <div class="m-value tp-compact">
+              <span id="tpMaxSupply">--</span><span class="m-unit">萬瓩（供給上限）</span>
+              <span class="tp-sep">/</span>
+              <span id="tpPeakLoad">--</span><span class="m-unit">萬瓩（需求負載）</span>
+            </div>
+            <div class="m-foot">
+              <span class="small">發布: <span id="tpPub">--</span></span>
+              <span class="small">來源：Taipower OpenData</span>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <section class="block" aria-label="控制">
+        <div class="block-h">
+          <div class="block-title">控制</div>
+          <div class="block-sub" id="modeStatus">讀取中...</div>
+        </div>
+
+        <div class="controls">
+          <button id="btnMains" class="ctrl-btn mains" type="button">
+            <div class="c-name">切換為市電 (D16)</div>
+            <div class="c-state" id="mainsState">INACTIVE</div>
+          </button>
+
+          <button id="btnHydro" class="ctrl-btn hydro" type="button">
+            <div class="c-name">切換為氫能 (D17)</div>
+            <div class="c-state" id="hydroState">INACTIVE</div>
+          </button>
+
+          <button id="btnClearManual" class="btn dimmed" type="button">目前為自動模式</button>
+
+          <hr style="border:0; border-top:1px solid rgba(255,255,255,0.1); width:100%; margin: 4px 0;">
+
+          <button id="btnLoad1" class="ctrl-btn load" type="button">
+            <div class="c-name">負載 1 (D18)</div>
+            <div class="c-state" id="load1State">OFF</div>
+          </button>
+
+          <button id="btnLoad2" class="ctrl-btn load" type="button">
+            <div class="c-name">負載 2 (D19)</div>
+            <div class="c-state" id="load2State">OFF</div>
+          </button>
+
+          <button id="btnLoad3" class="ctrl-btn load" type="button">
+            <div class="c-name">蓄電池充電開關 (D13)</div>
+            <div class="c-state" id="load3State">OFF</div>
+          </button>
+
+          <div id="l1Alert" class="alertbox hidden">
+            <span id="l1Text">市電 < 80V：電網崩潰，已切換氫能</span>
+            <span class="small">L1</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="block" aria-label="時段設置">
+        <div class="block-h">
+          <div class="block-title">時段設置</div>
+        </div>
+
+        <div class="schedule">
+          <div class="rule-edit">
+            <label>氫能供電 (D17) 開始時間</label>
+            <input type="time" id="schedStart" value="12:00">
+          </div>
+          <div class="rule-edit">
+            <label>氫能供電 (D17) 結束時間</label>
+            <input type="time" id="schedEnd" value="13:00">
+          </div>
+          <button id="btnSaveSched" class="btn" type="button">更新時段設定</button>
+
+          <div class="small" style="text-align:center; opacity:0.6; margin-top:5px;">
+            非此時段將自動切換回市電 (D16)
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="head">
+        <h2>系統日誌</h2>
+      </div>
+      <div id="log" class="logbox">
+        <div class="e">> 初始化中…</div>
+      </div>
+    </footer>
+  </div>
+
+  <script src="/script.js"></script>
+</body>
+</html>
