@@ -1,0 +1,547 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "EmonLib.h"
+#include "INA226.h"
+
+// ===== Wi-Fi 設定 (Wi-Fi Settings) =====
+#define WIFI_SSID         "11H3F"
+#define WIFI_PASSWORD     "0982359997"
+
+// ===== 電費費率 (Electricity Rate) =====
+// 單位：元/度 (TWD/kWh)
+#define ELECTRICITY_RATE  4.0
+
+// ===== NTP 時間伺服器設定 (NTP Server Settings) =====
+static const char* ntpServer = "pool.ntp.org";
+static const long  gmtOffset_sec = 28800; // UTC+8 (台灣時間)
+static const int   daylightOffset_sec = 0;
+
+// ===== 台電 OpenData (Taipower Open Data) =====
+static const char* TAIPOWER_URL =
+  "https://service.taipower.com.tw/data/opendata/apply/file/d006020/001.json";
+
+// 30 分鐘抓一次
+static const uint32_t TP_FETCH_INTERVAL_MS = 30UL * 60UL * 1000UL; // 1,800,000 ms
+// 資料過期：3 小時
+static const uint32_t TP_STALE_MS = 3UL * 60UL * 60UL * 1000UL; // 10,800,000 ms
+
+// ===== 繼電器觸發電位定義 (Relay Logic Levels) =====
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+// ===== 硬體腳位定義 (Hardware Pin Definitions) =====
+#define PIN_RELAY_SRC_GRID   16   // D16: 市電來源繼電器 (Mains Relay)
+#define PIN_RELAY_SRC_HYDRO  17   // D17: 氫能來源繼電器 (Hydro Relay)
+#define PIN_RELAY_LOAD_1     18   // D18: 負載 1 (Load 1)
+#define PIN_RELAY_LOAD_2     19   // D19: 負載 2 (Load 2)
+#define PIN_RELAY_LOAD_3     13   // D13: 蓄電池充電開關 (Battery Switch) - 獨立控制
+
+#define PIN_AC_VOLTAGE       35   // ZMPT101B 電壓互感器 (Voltage Sensor)
+#define PIN_AC_CURRENT       34   // SCT013 電流互感器 (Current Sensor)
+#define I2C_ADDRESS_INA226   0x40 // INA226 直流偵測模組 (DC Power Monitor)
+
+// ===== 物件宣告 (Object Instantiation) =====
+EnergyMonitor emon1;            // EmonLib 物件
+INA226 ina(I2C_ADDRESS_INA226); // INA226 物件
+WebServer server(80);           // 網頁伺服器 (Web Server)
+
+// ===== 系統狀態變數 (System State Variables) =====
+enum PowerSource { SOURCE_NONE, SOURCE_GRID, SOURCE_HYDRO };
+PowerSource currentSource = SOURCE_NONE; // 目前供電來源 (Current Power Source)
+
+bool manualOverrideActive = false;       // 手動模式旗標 (Manual Override Flag)
+PowerSource manualTarget = SOURCE_NONE;  // 手動目標來源 (Manual Target)
+bool l1ForcedHydro = false;              // L1 保護觸發旗標 (Protection Triggered Flag)
+
+// ===== 排程設定 (Schedule Settings) =====
+// 預設時段：12:00 ~ 13:00
+int sched_start_h = 12;
+int sched_start_m = 0;
+int sched_end_h   = 13;
+int sched_end_m   = 0;
+
+// ===== 感測器數據 (Sensor Data) =====
+float g_ac_voltage = 0.0;
+float g_ac_current = 0.0;
+float g_ac_power   = 0.0;
+float g_dc_voltage = 0.0;
+float g_dc_current = 0.0;
+
+// ===== 台電資料快取 (Taipower Cache) =====
+struct TaipowerCache {
+  bool ever_ok = false;         // 曾成功抓到
+  uint32_t last_ok_ms = 0;      // 上次成功抓到的 millis()
+  uint32_t last_try_ms = 0;     // 上次嘗試抓取 millis()
+
+  // 9 欄位
+  float curr_load = NAN;
+  int   curr_util_rate = -1;
+
+  float fore_maxi_sply_capacity = NAN;
+  float fore_peak_dema_load = NAN;
+  float fore_peak_resv_capacity = NAN;
+  float fore_peak_resv_rate = NAN;
+
+  String fore_peak_resv_indicator;
+  String fore_peak_hour_range;
+  String publish_time;
+};
+static TaipowerCache g_tp;
+
+// ===== 檔案系統輔助函式 (FS Helper) =====
+static void serveFile(const char* path, const char* contentType) {
+  if (!LittleFS.exists(path)) { server.send(404, "text/plain", "Not Found"); return; }
+  File f = LittleFS.open(path, "r");
+  if (!f) { server.send(500, "text/plain", "FS Error"); return; }
+  server.streamFile(f, contentType);
+  f.close();
+}
+
+// ===== 初始化函式 (Initialization Functions) =====
+static void initTime() { configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); }
+
+static void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) delay(500);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-GRID", "12345678");
+    Serial.print("[WiFi] AP IP: "); Serial.println(WiFi.softAPIP());
+  }
+}
+
+static void initHardware() {
+  pinMode(PIN_RELAY_SRC_GRID, OUTPUT);
+  pinMode(PIN_RELAY_SRC_HYDRO, OUTPUT);
+  pinMode(PIN_RELAY_LOAD_1, OUTPUT);
+  pinMode(PIN_RELAY_LOAD_2, OUTPUT);
+  pinMode(PIN_RELAY_LOAD_3, OUTPUT);
+
+  digitalWrite(PIN_RELAY_SRC_GRID, RELAY_OFF);
+  digitalWrite(PIN_RELAY_SRC_HYDRO, RELAY_OFF);
+  digitalWrite(PIN_RELAY_LOAD_1, RELAY_OFF);
+  digitalWrite(PIN_RELAY_LOAD_2, RELAY_OFF);
+  digitalWrite(PIN_RELAY_LOAD_3, RELAY_OFF);
+
+  emon1.voltage(PIN_AC_VOLTAGE, 260.0, 1.7);
+  emon1.current(PIN_AC_CURRENT, 29.0);
+
+  Wire.begin();
+  if (!ina.begin()) {
+    Serial.println("[Warn] INA226 missing");
+  } else {
+    ina.setMaxCurrentShunt(10.0, 0.01);
+  }
+}
+
+// ===== 台電抓取/解析 (Taipower Fetch/Parse) =====
+static bool tpIsValid() {
+  if (!g_tp.ever_ok) return false;
+  const uint32_t age = millis() - g_tp.last_ok_ms;
+  return age <= TP_STALE_MS;
+}
+
+static bool parseTaipowerJson(const String& payload) {
+  StaticJsonDocument<4096> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[TP] JSON parse failed: %s\n", err.c_str());
+    return false;
+  }
+
+  JsonArray records = doc["records"].as<JsonArray>();
+  if (records.isNull()) {
+    Serial.println("[TP] Missing records");
+    return false;
+  }
+
+  JsonObject curObj;
+  JsonObject foreObj;
+
+  for (JsonVariant v : records) {
+    if (!v.is<JsonObject>()) continue;
+    JsonObject o = v.as<JsonObject>();
+    if (o.containsKey("curr_load")) curObj = o;
+    if (o.containsKey("fore_peak_resv_rate")) foreObj = o;
+  }
+
+  if (curObj.isNull() || foreObj.isNull()) {
+    Serial.println("[TP] Missing expected objects");
+    return false;
+  }
+
+  g_tp.curr_load = String((const char*)curObj["curr_load"]).toFloat();
+  g_tp.curr_util_rate = String((const char*)curObj["curr_util_rate"]).toInt();
+
+  g_tp.fore_maxi_sply_capacity = String((const char*)foreObj["fore_maxi_sply_capacity"]).toFloat();
+  g_tp.fore_peak_dema_load     = String((const char*)foreObj["fore_peak_dema_load"]).toFloat();
+  g_tp.fore_peak_resv_capacity = String((const char*)foreObj["fore_peak_resv_capacity"]).toFloat();
+  g_tp.fore_peak_resv_rate     = String((const char*)foreObj["fore_peak_resv_rate"]).toFloat();
+
+  g_tp.fore_peak_resv_indicator = String((const char*)foreObj["fore_peak_resv_indicator"]);
+  g_tp.fore_peak_hour_range     = String((const char*)foreObj["fore_peak_hour_range"]);
+  g_tp.publish_time             = String((const char*)foreObj["publish_time"]);
+
+  return true;
+}
+
+static bool fetchTaipowerOnce() {
+  if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) {
+    Serial.println("[TP] Skip (no STA internet)");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // fallback for older cores
+  // Some cores use HTTPC_STRICT_FOLLOW_REDIRECTS; to be safe:
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, TAIPOWER_URL)) {
+    Serial.println("[TP] http.begin failed");
+    return false;
+  }
+
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Accept-Encoding", "identity");
+  http.addHeader("User-Agent", "ESP32-SmartGrid/1.0");
+
+  const int code = http.GET();
+  if (code <= 0) {
+    Serial.printf("[TP] GET failed: %s\n", http.errorToString(code).c_str());
+    http.end();
+    return false;
+  }
+
+  if (code != 200) {
+    Serial.printf("[TP] HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  if (payload.length() < 50) {
+    Serial.println("[TP] Payload too small");
+    return false;
+  }
+
+  if (!parseTaipowerJson(payload)) return false;
+
+  g_tp.ever_ok = true;
+  g_tp.last_ok_ms = millis();
+
+  Serial.printf("[TP] OK: curr_load=%.1f util=%d resv_rate=%.2f%% resv_mw=%.1f ind=%s\n",
+                g_tp.curr_load, g_tp.curr_util_rate,
+                g_tp.fore_peak_resv_rate,
+                g_tp.fore_peak_resv_capacity,
+                g_tp.fore_peak_resv_indicator.c_str());
+  return true;
+}
+
+static void tpTick() {
+  const uint32_t now = millis();
+  if (g_tp.last_try_ms == 0 || (now - g_tp.last_try_ms) >= TP_FETCH_INTERVAL_MS) {
+    g_tp.last_try_ms = now;
+    Serial.println("[TP] Fetch...");
+    fetchTaipowerOnce();
+  }
+}
+
+// ===== 電源切換邏輯 - 安全模式 (Power Switching Logic - Safe Mode) =====
+static void setPowerSource(PowerSource target) {
+  if (target == currentSource) return;
+
+  Serial.println("[Switch] Sequence Started...");
+
+  bool load1_was_on = (digitalRead(PIN_RELAY_LOAD_1) == RELAY_ON);
+  bool load2_was_on = (digitalRead(PIN_RELAY_LOAD_2) == RELAY_ON);
+
+  if (load1_was_on) digitalWrite(PIN_RELAY_LOAD_1, RELAY_OFF);
+  if (load2_was_on) digitalWrite(PIN_RELAY_LOAD_2, RELAY_OFF);
+
+  if (load1_was_on || load2_was_on) delay(100);
+
+  digitalWrite(PIN_RELAY_SRC_GRID, RELAY_OFF);
+  digitalWrite(PIN_RELAY_SRC_HYDRO, RELAY_OFF);
+
+  delay(300);
+
+  if (target == SOURCE_GRID) {
+    digitalWrite(PIN_RELAY_SRC_GRID, RELAY_ON);
+  } else if (target == SOURCE_HYDRO) {
+    digitalWrite(PIN_RELAY_SRC_HYDRO, RELAY_ON);
+  }
+
+  delay(100);
+
+  if (load1_was_on) digitalWrite(PIN_RELAY_LOAD_1, RELAY_ON);
+  if (load2_was_on) digitalWrite(PIN_RELAY_LOAD_2, RELAY_ON);
+
+  currentSource = target;
+  Serial.printf("[Switch] Complete -> %s\n", target == SOURCE_GRID ? "GRID" :
+                                           target == SOURCE_HYDRO ? "HYDRO" : "NONE");
+}
+
+// ===== 負載切換邏輯 (Load Toggle Logic) =====
+static void toggleLoad(int pin) {
+  // 保持你的原本邏輯效果，但寫得更符合 RELAY_ON/OFF（不改行為）
+  const bool isOn = (digitalRead(pin) == RELAY_ON);
+  digitalWrite(pin, isOn ? RELAY_OFF : RELAY_ON);
+}
+
+// ===== 讀取感測器 (Read Sensors) =====
+static void readSensors() {
+  emon1.calcVI(20, 1000);
+
+  g_ac_voltage = emon1.Vrms;
+  g_ac_current = emon1.Irms;
+  g_ac_power   = emon1.apparentPower;
+
+  if (g_ac_voltage < 5.0) g_ac_voltage = 0;
+  if (g_ac_power < 5.0) g_ac_power = 0;
+
+  g_dc_voltage = ina.getBusVoltage();
+  g_dc_current = ina.getCurrent_mA() / 1000.0;
+}
+
+// ===== 排程檢查 (Schedule Check) =====
+static bool isInSchedule() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return false;
+
+  const int nowM = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  const int startM = sched_start_h * 60 + sched_start_m;
+  const int endM   = sched_end_h * 60 + sched_end_m;
+
+  if (startM < endM) {
+    return (nowM >= startM && nowM < endM);
+  } else if (startM > endM) {
+    return (nowM >= startM || nowM < endM);
+  }
+  return false;
+}
+
+// ===== 核心控制邏輯 (Core Control Logic) =====
+static void updatePowerLogic() {
+  const bool inSched = isInSchedule();
+  const bool gridOk  = (g_ac_voltage >= 80.0f);
+
+  // [L1] 市電崩潰保護 (Grid Collapse Protection)
+  if (!gridOk) {
+    l1ForcedHydro = true;
+    if (currentSource != SOURCE_HYDRO) {
+      Serial.println("[L1] Collapse (<80V) -> HYDRO");
+      setPowerSource(SOURCE_HYDRO);
+    }
+    return;
+  }
+
+  // L1 復歸 (Recovery)
+  if (l1ForcedHydro) {
+    Serial.println("[L1] Recovery -> Release");
+    l1ForcedHydro = false;
+  }
+
+  // [L2] 排程控制 (Schedule Control)
+  if (inSched) {
+    if (currentSource != SOURCE_HYDRO) {
+      Serial.printf("[L2] Schedule (%02d:%02d~%02d:%02d) -> HYDRO\n",
+                    sched_start_h, sched_start_m, sched_end_h, sched_end_m);
+      setPowerSource(SOURCE_HYDRO);
+    }
+    return;
+  }
+
+  // [L3] 手動覆寫 (Manual Override)
+  if (manualOverrideActive) {
+    if (manualTarget == SOURCE_GRID && currentSource != SOURCE_GRID) {
+      setPowerSource(SOURCE_GRID);
+    } else if (manualTarget == SOURCE_HYDRO && currentSource != SOURCE_HYDRO) {
+      setPowerSource(SOURCE_HYDRO);
+    }
+    return;
+  }
+
+  // [Default]
+  if (currentSource != SOURCE_GRID) {
+    Serial.println("[Default] -> GRID");
+    setPowerSource(SOURCE_GRID);
+  }
+}
+
+// ===== API 處理函式 (API Handlers) =====
+static void handleRoot() { serveFile("/index.html", "text/html"); }
+
+static void handleStatus() {
+  StaticJsonDocument<1536> doc;
+
+  doc["grid_v"] = serialized(String(g_ac_voltage, 1));
+  doc["grid_a"] = serialized(String(g_ac_current, 2));
+  doc["grid_w"] = serialized(String(g_ac_power, 0));
+
+  float cost = (g_ac_power / 1000.0f) * ELECTRICITY_RATE;
+  doc["est_cost"] = serialized(String(cost, 2));
+
+  doc["batt_v"] = serialized(String(g_dc_voltage, 2));
+  doc["batt_a"] = serialized(String(g_dc_current, 2));
+
+  doc["relay_grid"]  = (digitalRead(PIN_RELAY_SRC_GRID) == RELAY_ON);
+  doc["relay_hydro"] = (digitalRead(PIN_RELAY_SRC_HYDRO) == RELAY_ON);
+  doc["relay_load1"] = (digitalRead(PIN_RELAY_LOAD_1) == RELAY_ON);
+  doc["relay_load2"] = (digitalRead(PIN_RELAY_LOAD_2) == RELAY_ON);
+  doc["relay_load3"] = (digitalRead(PIN_RELAY_LOAD_3) == RELAY_ON);
+
+  if (currentSource == SOURCE_GRID) doc["src_mode"] = "grid";
+  else if (currentSource == SOURCE_HYDRO) doc["src_mode"] = "hydro";
+  else doc["src_mode"] = "none";
+
+  doc["in_schedule"] = isInSchedule();
+  doc["manual_override"] = manualOverrideActive;
+
+  doc["sched_sh"] = sched_start_h;
+  doc["sched_sm"] = sched_start_m;
+  doc["sched_eh"] = sched_end_h;
+  doc["sched_em"] = sched_end_m;
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char timeStr[9];
+    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+    doc["time"] = timeStr;
+  } else {
+    doc["time"] = "--:--:--";
+  }
+
+  doc["uptime"] = (uint32_t)(millis() / 1000UL);
+  if (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED) doc["rssi"] = WiFi.RSSI();
+  else doc["rssi"] = 0;
+
+  // ===== 台電資訊輸出 (Taipower) =====
+  doc["tp_ok"] = tpIsValid();
+  doc["tp_age_sec"] = g_tp.ever_ok ? (uint32_t)((millis() - g_tp.last_ok_ms) / 1000UL) : 0;
+
+  JsonObject tp = doc.createNestedObject("tp");
+  if (g_tp.ever_ok) {
+    tp["curr_load"] = serialized(String(g_tp.curr_load, 1));
+    tp["curr_util_rate"] = g_tp.curr_util_rate;
+
+    tp["fore_maxi_sply_capacity"] = serialized(String(g_tp.fore_maxi_sply_capacity, 1));
+    tp["fore_peak_dema_load"]     = serialized(String(g_tp.fore_peak_dema_load, 1));
+    tp["fore_peak_resv_capacity"] = serialized(String(g_tp.fore_peak_resv_capacity, 1));
+    tp["fore_peak_resv_rate"]     = serialized(String(g_tp.fore_peak_resv_rate, 2));
+
+    tp["fore_peak_resv_indicator"] = g_tp.fore_peak_resv_indicator;
+    tp["fore_peak_hour_range"]     = g_tp.fore_peak_hour_range;
+    tp["publish_time"]             = g_tp.publish_time;
+  }
+
+  String res;
+  serializeJson(doc, res);
+  server.send(200, "application/json", res);
+}
+
+static void handleControl() {
+  const String target = server.arg("target");
+  const String state  = server.arg("state");
+
+  bool ok = true;
+
+  if (target == "grid" && state == "on") {
+    manualOverrideActive = true;
+    manualTarget = SOURCE_GRID;
+  } else if (target == "hydro" && state == "on") {
+    manualOverrideActive = true;
+    manualTarget = SOURCE_HYDRO;
+  } else if (target == "manual" && state == "off") {
+    manualOverrideActive = false;
+    manualTarget = SOURCE_NONE;
+  } else if (target == "load1" && state == "toggle") {
+    toggleLoad(PIN_RELAY_LOAD_1);
+  } else if (target == "load2" && state == "toggle") {
+    toggleLoad(PIN_RELAY_LOAD_2);
+  } else if (target == "load3" && state == "toggle") {
+    toggleLoad(PIN_RELAY_LOAD_3);
+  } else {
+    ok = false;
+  }
+
+  if (!ok) { server.send(400, "text/plain", "BAD REQUEST"); return; }
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleSettings() {
+  if (server.hasArg("sh") && server.hasArg("sm") && server.hasArg("eh") && server.hasArg("em")) {
+    sched_start_h = server.arg("sh").toInt();
+    sched_start_m = server.arg("sm").toInt();
+    sched_end_h   = server.arg("eh").toInt();
+    sched_end_m   = server.arg("em").toInt();
+    Serial.printf("[Sched] Update: %02d:%02d - %02d:%02d\n",
+                  sched_start_h, sched_start_m, sched_end_h, sched_end_m);
+  }
+
+  StaticJsonDocument<256> doc;
+  doc["sh"] = sched_start_h;
+  doc["sm"] = sched_start_m;
+  doc["eh"] = sched_end_h;
+  doc["em"] = sched_end_m;
+  String res;
+  serializeJson(doc, res);
+  server.send(200, "application/json", res);
+}
+
+// ===== 主程式 (Main Program) =====
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  if(!LittleFS.begin(true)){
+    Serial.println("[FS] Mount Failed");
+    return;
+  }
+
+  initHardware();
+  initWiFi();
+  initTime();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/index.html", HTTP_GET, handleRoot);
+  server.on("/style.css", HTTP_GET, [](){ serveFile("/style.css", "text/css"); });
+  server.on("/script.js", HTTP_GET, [](){ serveFile("/script.js", "application/javascript"); });
+
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/control", HTTP_GET, handleControl);
+  server.on("/api/settings", HTTP_GET, handleSettings);
+
+  server.begin();
+  Serial.println("[System] Ready");
+}
+
+void loop() {
+  server.handleClient();
+
+  // 台電低頻抓取（30 分鐘一次；開機會先抓一次）
+  tpTick();
+
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate >= 1000) {
+    lastUpdate = millis();
+    readSensors();
+    updatePowerLogic();
+  }
+}
