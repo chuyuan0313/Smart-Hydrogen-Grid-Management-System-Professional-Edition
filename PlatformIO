@@ -1,0 +1,21 @@
+; PlatformIO Project Configuration File
+; Project: Smart Grid Management System
+; Hardware: ESP32 Dev Module
+
+[env:esp32dev]
+platform = espressif32
+board = esp32dev
+framework = arduino
+
+; 設置檔案系統為 LittleFS (用於存放 HTML/CSS/JS)
+board_build.filesystem = littlefs
+
+; 監控與燒錄速度
+monitor_speed = 115200
+upload_speed = 921600
+
+; 依賴庫
+lib_deps =
+    openenergymonitor/EmonLib @ ^1.1.0
+    robtillaart/INA226 @ ^0.6.0
+    bblanchon/ArduinoJson @ ^6.21.3
